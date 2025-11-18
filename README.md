@@ -19,7 +19,13 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-3. Run the FastAPI server:
+3. Set your Bluesky credentials (required for all searches):
+```bash
+export BLUESKY_HANDLE="you@example.com"
+export BLUESKY_APP_PASSWORD="xxxx-xxxx-xxxx-xxxx"
+```
+
+4. Run the FastAPI server:
 ```bash
 ./run.sh
 # Or manually:

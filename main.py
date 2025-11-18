@@ -3,17 +3,20 @@ import asyncio
 import io
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 import httpx
 import pandas as pd
+from nltk.stem import PorterStemmer
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+stemmer = PorterStemmer()
 
 app = FastAPI()
 
@@ -26,23 +29,45 @@ app.add_middleware(
 )
 
 SEARCH_PAGE_LIMIT = 100
-RECENT_DAYS = 7
-BLUESKY_PUBLIC_HOST = os.getenv("BLUESKY_PUBLIC_HOST", "https://public.api.bsky.app")
+RECENT_DAYS = 30
 BLUESKY_AUTH_HOST = os.getenv("BLUESKY_AUTH_HOST", "https://bsky.social")
 BLUESKY_HANDLE = os.getenv("BLUESKY_HANDLE")
 BLUESKY_APP_PASSWORD = os.getenv("BLUESKY_APP_PASSWORD") or os.getenv("BLUESKY_PASSWORD")
-BLUESKY_PUBLIC_SEARCH_URL = f"{BLUESKY_PUBLIC_HOST.rstrip('/')}/xrpc/app.bsky.feed.searchPosts"
 BLUESKY_AUTH_SEARCH_URL = f"{BLUESKY_AUTH_HOST.rstrip('/')}/xrpc/app.bsky.feed.searchPosts"
 BLUESKY_SESSION_URL = f"{BLUESKY_AUTH_HOST.rstrip('/')}/xrpc/com.atproto.server.createSession"
 _SESSION_LOCK = asyncio.Lock()
 _SESSION_STATE: Dict[str, Optional[str]] = {"access": None, "refresh": None}
 
 
+def _require_bluesky_credentials() -> None:
+    if not BLUESKY_HANDLE or not BLUESKY_APP_PASSWORD:
+        raise RuntimeError(
+            "Bluesky credentials are not configured. "
+            "Set BLUESKY_HANDLE and BLUESKY_APP_PASSWORD (or BLUESKY_PASSWORD)."
+        )
+
+
 def rewrite_search_query(term: str) -> str:
+    """
+    Normalize and stem search terms before sending to Bluesky.
+
+    - Remove punctuation
+    - Lowercase
+    - Split into tokens
+    - Stem each token using PorterStemmer
+    """
     if not term:
         return ""
-    sanitized = term.replace('"', "").strip()
-    return " ".join(sanitized.split())
+
+    # remove punctuation and lowercase
+    sanitized = re.sub(r"[^A-Za-z0-9\s]", " ", term).lower().strip()
+    tokens = sanitized.split()
+
+    # apply stemming
+    stemmed_tokens = [stemmer.stem(tok) for tok in tokens]
+
+    # return space-separated stemmed query
+    return " ".join(stemmed_tokens)
 
 
 async def _ensure_bluesky_session(client: httpx.AsyncClient, *, force: bool = False) -> str:
@@ -90,8 +115,6 @@ async def _search_official_endpoint(
     client: httpx.AsyncClient,
     endpoint: str,
     query: str,
-    *,
-    authenticated: bool,
 ) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=RECENT_DAYS)
     cursor: Optional[str] = None
@@ -100,13 +123,12 @@ async def _search_official_endpoint(
     headers: Dict[str, str] = {}
     max_pages = 10  # Limit pagination to prevent infinite loops
 
-    if authenticated:
-        try:
-            token = await _ensure_bluesky_session(client, force=False)
-            headers["Authorization"] = f"Bearer {token}"
-        except Exception as e:
-            logger.warning(f"Failed to authenticate: {e}")
-            return 0
+    try:
+        token = await _ensure_bluesky_session(client, force=False)
+        headers["Authorization"] = f"Bearer {token}"
+    except Exception as e:
+        logger.warning(f"Failed to authenticate: {e}")
+        return 0
 
     refreshed = False
     page_count = 0
@@ -117,7 +139,7 @@ async def _search_official_endpoint(
             params["cursor"] = cursor
 
         try:
-            logger.info(f"Searching Bluesky: query='{query}', page={page_count + 1}, authenticated={authenticated}")
+            logger.info(f"Searching Bluesky: query='{query}', page={page_count + 1}")
             response = await client.get(endpoint, params=params, headers=headers, timeout=10.0)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -127,7 +149,7 @@ async def _search_official_endpoint(
             
             # Handle authentication errors
             if status_code in (401, 403):
-                if authenticated and not refreshed:
+                if not refreshed:
                     try:
                         token = await _ensure_bluesky_session(client, force=True)
                         headers["Authorization"] = f"Bearer {token}"
@@ -135,7 +157,6 @@ async def _search_official_endpoint(
                         continue
                     except Exception as e:
                         logger.error(f"Failed to refresh session: {e}")
-                # If not authenticated or already refreshed, return 0
                 return total
             
             # For other HTTP errors, return what we have so far
@@ -209,29 +230,14 @@ async def search_term(term: str) -> int:
         return 0
 
     try:
+        _require_bluesky_credentials()
         async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
-            # Try authenticated endpoint first if credentials are available
-            if BLUESKY_HANDLE and BLUESKY_APP_PASSWORD:
-                logger.info(f"Using authenticated search for '{query}'")
-                count = await _search_official_endpoint(
-                    client,
-                    BLUESKY_AUTH_SEARCH_URL,
-                    query,
-                    authenticated=True,
-                )
-                if count > 0:
-                    return count
-            
-            # Fallback to public endpoint (may require auth, but worth trying)
-            logger.info(f"Trying public endpoint for '{query}'")
-            count = await _search_official_endpoint(
+            logger.info(f"Searching Bluesky for '{query}' using authenticated API")
+            return await _search_official_endpoint(
                 client,
-                BLUESKY_PUBLIC_SEARCH_URL,
+                BLUESKY_AUTH_SEARCH_URL,
                 query,
-                authenticated=False,
             )
-            return count
-            
     except Exception as e:
         logger.error(f"Unexpected error searching for '{term}': {e}")
         return 0
@@ -250,13 +256,28 @@ async def process_csv(file: UploadFile = File(...)):
         if "search_terms" not in df.columns:
             raise HTTPException(status_code=400, detail="Missing search_terms column")
 
+        try:
+            _require_bluesky_credentials()
+        except RuntimeError as cred_error:
+            logger.error(str(cred_error))
+            raise HTTPException(status_code=500, detail=str(cred_error))
+
         results = []
         total_rows = len(df)
         for row_number, (_, row) in enumerate(df.iterrows(), start=1):
             try:
-                terms = ast.literal_eval(row["search_terms"])
-                if not isinstance(terms, list):
-                    raise ValueError()
+                search_terms_value = str(row["search_terms"]).strip()
+                if not search_terms_value or search_terms_value.lower() == 'nan':
+                    terms = []
+                else:
+                    # Try to parse as Python list first (for backward compatibility)
+                    try:
+                        terms = ast.literal_eval(search_terms_value)
+                        if not isinstance(terms, list):
+                            raise ValueError()
+                    except (ValueError, SyntaxError):
+                        # If that fails, treat as semicolon-separated string
+                        terms = [t.strip() for t in search_terms_value.split(';') if t.strip()]
             except Exception as e:
                 logger.error(f"Row {row_number}: invalid search_terms - {e}")
                 raise HTTPException(status_code=400, detail=f"Row {row_number}: invalid search_terms")
@@ -274,7 +295,9 @@ async def process_csv(file: UploadFile = File(...)):
                     freqs.append(0)
             results.append(freqs)
 
-        df["search_frequency"] = results
+        # Find the index of search_terms column and insert the new column right after it
+        search_terms_idx = df.columns.get_loc("search_terms")
+        df.insert(search_terms_idx + 1, "search_frequency", results)
 
         out = io.StringIO()
         df.to_csv(out, index=False)

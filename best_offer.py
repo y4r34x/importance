@@ -1,10 +1,9 @@
 import pandas as pd
 import numpy as np
 
-def equations(x: None, avgs: np.array):
+def equations(x: None, avgs: np.array, set_equity: float = 0.3):
   
   c, v = x
-  set_equity = 0.3
   avg_score = avgs[0]
   avg_ratio = avgs[1]
 

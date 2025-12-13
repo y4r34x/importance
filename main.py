@@ -32,7 +32,8 @@ def main():
   # Step 3: Solve the equation to get the score:
   equations = best_offer.equations
   initial_guess = [1,1]
-  offer = fsolve(lambda x: equations(x, avgs), initial_guess)
+  set_equity = 0.3
+  offer = fsolve(lambda x: equations(x, avgs, set_equity), initial_guess)
 
   if offer is not None:
     print(f"\n Before rounding, if you're to accept the 30% equity ownership offer, you should add a vesting period of {np.round((offer[1] / 365),2)} years and a cliff at {np.round((offer[0] / 365),2)} years. \n")

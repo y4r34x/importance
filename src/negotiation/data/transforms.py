@@ -1,5 +1,6 @@
 """Data transformation utilities for contract features."""
 import pandas as pd
+import numpy as np
 from datetime import datetime
 
 
@@ -119,5 +120,109 @@ def encode_boolean_columns(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = df[col].apply(
                     lambda x: 1 if str(x).lower() == 'yes' else (0 if str(x).lower() == 'no' else None)
                 )
+
+    return df
+
+
+def bucket_renewal_term(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bucket 'Renewal Term (Days)' into ordinal categories.
+
+    Categories:
+        0 = none/unspecified (NaN or 0)
+        1 = short (< 365 days)
+        2 = standard (365 days / 1 year)
+        3 = long (366-1095 days / 2-3 years)
+        4 = very_long (> 1095 days / 3+ years)
+
+    Args:
+        df: DataFrame with 'Renewal Term (Days)' column
+
+    Returns:
+        DataFrame with additional 'Renewal Term Bucket' column
+    """
+    df = df.copy()
+
+    col = 'Renewal Term (Days)'
+    if col not in df.columns:
+        return df
+
+    def bucket(val):
+        if pd.isna(val):
+            return 0
+        # Handle string values like "3 years" or "successive 1820"
+        if isinstance(val, str):
+            val = val.lower().strip()
+            # Try to extract number
+            import re
+            nums = re.findall(r'\d+', val)
+            if nums:
+                val = int(nums[0])
+                # If it mentions "years", multiply
+                if 'year' in val if isinstance(val, str) else False:
+                    val = val * 365
+            else:
+                return 0
+        try:
+            val = float(val)
+        except (ValueError, TypeError):
+            return 0
+
+        if val <= 0:
+            return 0
+        elif val < 365:
+            return 1  # short
+        elif val == 365:
+            return 2  # standard (1 year)
+        elif val <= 1095:
+            return 3  # long (2-3 years)
+        else:
+            return 4  # very_long (3+ years)
+
+    df['Renewal Term Bucket'] = df[col].apply(bucket)
+
+    return df
+
+
+def bucket_notice_period(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bucket 'Notice Period To Terminate Renewal' into ordinal categories.
+
+    Categories:
+        0 = none/unspecified (NaN)
+        1 = short (≤ 30 days)
+        2 = standard (31-90 days)
+        3 = long (> 90 days)
+
+    Args:
+        df: DataFrame with 'Notice Period To Terminate Renewal' column
+
+    Returns:
+        DataFrame with additional 'Notice Period Bucket' column
+    """
+    df = df.copy()
+
+    col = 'Notice Period To Terminate Renewal'
+    if col not in df.columns:
+        return df
+
+    def bucket(val):
+        if pd.isna(val):
+            return 0
+        try:
+            val = float(val)
+        except (ValueError, TypeError):
+            return 0
+
+        if val <= 0:
+            return 0
+        elif val <= 30:
+            return 1  # short
+        elif val <= 90:
+            return 2  # standard
+        else:
+            return 3  # long
+
+    df['Notice Period Bucket'] = df[col].apply(bucket)
 
     return df
